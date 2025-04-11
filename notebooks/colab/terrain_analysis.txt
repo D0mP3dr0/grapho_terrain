@@ -1,0 +1,617 @@
+# Grapho Terrain - Análise de Terreno
+# Este notebook implementa análises completas de terreno utilizando a biblioteca grapho_terrain
+
+# --- 1. Configuração do Ambiente ---
+
+# Montar o Google Drive (opcional)
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Criar diretório para output
+!mkdir -p /content/output
+
+# Instalação das dependências
+!pip install numpy pandas geopandas matplotlib shapely folium contextily rtree pyproj h3 rasterio elevation richdem
+!pip install torch==2.0.1 torchvision==0.15.2
+!pip install torch-scatter torch-sparse torch-cluster torch-geometric -f https://data.pyg.org/whl/torch-2.0.1+cu118.html
+
+# Clonar o repositório grapho_terrain
+!git clone https://github.com/D0mP3dr0/grapho_terrain.git
+!cd grapho_terrain && pip install -e .
+
+import os
+import gc
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import rasterio
+from rasterio.plot import show as rioshow
+from shapely.geometry import Point, Polygon, LineString
+
+# Importar módulos do grapho_terrain
+from grapho_terrain.terrain.dem import (
+    load_dem, 
+    calculate_slope, 
+    calculate_aspect,
+    calculate_hillshade
+)
+from grapho_terrain.terrain.viewshed import calculate_viewshed
+from grapho_terrain.terrain.utils import (
+    sample_dem_at_points,
+    clip_dem_to_boundary
+)
+from grapho_terrain.network.feature_graphs import FeatureGeoGraph
+
+# Configurações para evitar warnings
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configurar para utilizar GPU se disponível
+import torch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando: {device}")
+
+# --- 2. Funções para Otimização de Memória ---
+
+def clear_memory():
+    """Liberar memória não utilizada."""
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+def process_raster_in_tiles(raster_path, tile_size=1024, func=None):
+    """Processa um raster em blocos para economizar memória."""
+    with rasterio.open(raster_path) as src:
+        meta = src.meta.copy()
+        height = src.height
+        width = src.width
+        
+        # Calcular número de tiles
+        n_tiles_y = int(np.ceil(height / tile_size))
+        n_tiles_x = int(np.ceil(width / tile_size))
+        
+        # Criar arquivo de saída se necessário
+        if func:
+            # Ajustar metadados conforme necessário para a função
+            out_meta = meta.copy()
+            out_path = raster_path.replace('.tif', f'_{func.__name__}.tif')
+            with rasterio.open(out_path, 'w', **out_meta) as dst:
+                # Processar cada tile
+                for i in range(n_tiles_y):
+                    for j in range(n_tiles_x):
+                        # Calcular coordenadas do tile
+                        y_start = i * tile_size
+                        y_end = min((i + 1) * tile_size, height)
+                        x_start = j * tile_size
+                        x_end = min((j + 1) * tile_size, width)
+                        
+                        # Ler tile
+                        window = rasterio.windows.Window(x_start, y_start, x_end - x_start, y_end - y_start)
+                        tile = src.read(window=window)
+                        
+                        # Processar tile
+                        result = func(tile)
+                        
+                        # Escrever resultado
+                        dst.write(result, window=window)
+            
+            return out_path
+        else:
+            # Apenas retornar metadados
+            return meta
+
+# --- 3. Obtenção de Dados de Elevação ---
+
+def download_dem_data(bounds, output_path, source='SRTM3'):
+    """Baixa dados de elevação para a região definida pelos limites.
+    
+    Args:
+        bounds (tuple): (min_lon, min_lat, max_lon, max_lat)
+        output_path (str): Caminho para salvar o arquivo DEM
+        source (str): Fonte dos dados (SRTM1 ou SRTM3)
+    
+    Returns:
+        str: Caminho para o arquivo DEM baixado
+    """
+    try:
+        import elevation
+    except ImportError:
+        !pip install elevation
+        import elevation
+    
+    # Limites
+    min_lon, min_lat, max_lon, max_lat = bounds
+    
+    # Baixar dados
+    elevation.clip(
+        bounds=(min_lon, min_lat, max_lon, max_lat),
+        output=output_path,
+        product=source
+    )
+    
+    return output_path
+
+# Exemplo: Baixar DEM para a região de São Paulo
+# Descomente para baixar dados reais
+# dem_path = download_dem_data(
+#     bounds=(-46.8, -24.0, -46.3, -23.3),  # São Paulo
+#     output_path='/content/output/sao_paulo_dem.tif',
+#     source='SRTM3'
+# )
+
+# Criar DEM sintético para testes
+def create_synthetic_dem(output_path, width=500, height=500):
+    """Criar um DEM sintético para testes."""
+    # Gerar dados sintéticos
+    x = np.linspace(0, 10, width)
+    y = np.linspace(0, 10, height)
+    xx, yy = np.meshgrid(x, y)
+    
+    # Criar superfície com algumas colinas e vales
+    zz = 200 + 50 * np.sin(xx) + 50 * np.cos(yy) + 100 * np.exp(-((xx-5)**2 + (yy-5)**2)/10)
+    
+    # Adicionar ruído
+    zz += np.random.normal(0, 5, size=zz.shape)
+    
+    # Salvar como GeoTIFF
+    transform = rasterio.transform.from_origin(0, 0, 0.01, 0.01)
+    with rasterio.open(
+        output_path,
+        'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=1,
+        dtype=zz.dtype,
+        crs='+proj=latlong',
+        transform=transform,
+    ) as dst:
+        dst.write(zz, 1)
+    
+    return output_path
+
+# Criar DEM sintético
+dem_path = create_synthetic_dem('/content/output/synthetic_dem.tif')
+print(f"DEM criado em: {dem_path}")
+
+# Visualizar o DEM
+with rasterio.open(dem_path) as src:
+    dem_data = src.read(1)
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(dem_data, cmap='terrain')
+    plt.colorbar(im, ax=ax, label='Elevação (m)')
+    plt.title('Modelo Digital de Elevação')
+    plt.tight_layout()
+    plt.savefig('/content/output/dem_visualization.png', dpi=300)
+    plt.show()
+
+# --- 4. Análise de Terreno Básica ---
+
+# Calcular derivadas do terreno
+def calculate_terrain_derivatives(dem_path):
+    # Calcular declividade
+    slope_path = dem_path.replace('.tif', '_slope.tif')
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1)
+        meta = src.meta.copy()
+        
+        # Calcular declividade
+        slope = calculate_slope(dem, src.transform)
+        
+        # Salvar declividade
+        with rasterio.open(slope_path, 'w', **meta) as dst:
+            dst.write(slope, 1)
+    
+    # Calcular aspecto
+    aspect_path = dem_path.replace('.tif', '_aspect.tif')
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1)
+        meta = src.meta.copy()
+        
+        # Calcular aspecto
+        aspect = calculate_aspect(dem, src.transform)
+        
+        # Salvar aspecto
+        with rasterio.open(aspect_path, 'w', **meta) as dst:
+            dst.write(aspect, 1)
+    
+    # Calcular hillshade
+    hillshade_path = dem_path.replace('.tif', '_hillshade.tif')
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1)
+        meta = src.meta.copy()
+        
+        # Calcular hillshade
+        hillshade = calculate_hillshade(dem, src.transform)
+        
+        # Salvar hillshade
+        with rasterio.open(hillshade_path, 'w', **meta) as dst:
+            dst.write(hillshade, 1)
+    
+    return slope_path, aspect_path, hillshade_path
+
+# Calcular derivadas
+slope_path, aspect_path, hillshade_path = calculate_terrain_derivatives(dem_path)
+
+# Visualizar resultados
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+# DEM
+with rasterio.open(dem_path) as src:
+    rioshow(src, ax=axes[0, 0], cmap='terrain', title='Elevação')
+
+# Declividade
+with rasterio.open(slope_path) as src:
+    rioshow(src, ax=axes[0, 1], cmap='viridis', title='Declividade')
+
+# Aspecto
+with rasterio.open(aspect_path) as src:
+    rioshow(src, ax=axes[1, 0], cmap='hsv', title='Aspecto')
+
+# Hillshade
+with rasterio.open(hillshade_path) as src:
+    rioshow(src, ax=axes[1, 1], cmap='gray', title='Hillshade')
+
+plt.tight_layout()
+plt.savefig('/content/output/terrain_derivatives.png', dpi=300)
+plt.show()
+
+# Liberar memória
+clear_memory()
+
+# --- 5. Análise de Visibilidade (Viewshed) ---
+
+# Calcular viewshed
+def calculate_viewshed_analysis(dem_path, observer_points):
+    """Calcula área visível a partir de pontos de observação.
+    
+    Args:
+        dem_path (str): Caminho para o arquivo DEM
+        observer_points (list): Lista de pontos (x, y, altura) para observadores
+    
+    Returns:
+        str: Caminho para o arquivo de viewshed
+    """
+    # Criar arquivo de saída
+    viewshed_path = dem_path.replace('.tif', '_viewshed.tif')
+    
+    # Abrir DEM
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1)
+        meta = src.meta.copy()
+        
+        # Inicializar viewshed com zeros
+        viewshed = np.zeros_like(dem, dtype=np.uint8)
+        
+        # Calcular viewshed para cada ponto
+        for i, (x, y, height) in enumerate(observer_points):
+            # Converter coordenadas para índices de pixel
+            row, col = src.index(x, y)
+            
+            # Garantir que o ponto está dentro do raster
+            if 0 <= row < dem.shape[0] and 0 <= col < dem.shape[1]:
+                # Calcular viewshed
+                vs = calculate_viewshed(
+                    dem=dem,
+                    observer_row=row,
+                    observer_col=col,
+                    observer_height=height,
+                    max_distance=5000  # metros
+                )
+                
+                # Adicionar ao viewshed acumulado
+                viewshed = np.maximum(viewshed, vs)
+        
+        # Salvar viewshed
+        with rasterio.open(viewshed_path, 'w', **meta) as dst:
+            dst.write(viewshed, 1)
+    
+    return viewshed_path
+
+# Criar alguns pontos de observação
+# Para o DEM sintético, usar coordenadas dentro dos limites do raster
+with rasterio.open(dem_path) as src:
+    width, height = src.width, src.height
+    observer_points = [
+        (width * 0.25, height * 0.25, 10),  # (x, y, altura do observador)
+        (width * 0.75, height * 0.75, 10),
+        (width * 0.25, height * 0.75, 10),
+    ]
+
+# Calcular viewshed
+viewshed_path = calculate_viewshed_analysis(dem_path, observer_points)
+
+# Visualizar resultados
+fig, ax = plt.subplots(figsize=(12, 10))
+
+# Primeiro plotar o hillshade como base
+with rasterio.open(hillshade_path) as src:
+    hillshade = src.read(1)
+    ax.imshow(hillshade, cmap='gray', alpha=0.7)
+
+# Plotar o viewshed por cima
+with rasterio.open(viewshed_path) as src:
+    viewshed = src.read(1)
+    ax.imshow(viewshed, cmap='autumn', alpha=0.5)
+
+# Marcar pontos de observação
+for x, y, _ in observer_points:
+    ax.plot(x, y, 'bo', markersize=10)
+
+ax.set_title('Análise de Visibilidade')
+plt.savefig('/content/output/viewshed_analysis.png', dpi=300)
+plt.show()
+
+# Liberar memória
+clear_memory()
+
+# --- 6. Análise de Perfis de Terreno ---
+
+def create_terrain_profile(dem_path, start_point, end_point, num_points=100):
+    """Cria um perfil de terreno entre dois pontos.
+    
+    Args:
+        dem_path (str): Caminho para o arquivo DEM
+        start_point (tuple): Ponto inicial (x, y)
+        end_point (tuple): Ponto final (x, y)
+        num_points (int): Número de pontos no perfil
+    
+    Returns:
+        tuple: (distâncias, elevações)
+    """
+    with rasterio.open(dem_path) as src:
+        # Gerar pontos na linha
+        x_start, y_start = start_point
+        x_end, y_end = end_point
+        
+        # Criar linha
+        x = np.linspace(x_start, x_end, num_points)
+        y = np.linspace(y_start, y_end, num_points)
+        
+        # Calcular distância
+        distances = np.sqrt((x - x_start)**2 + (y - y_start)**2)
+        
+        # Amostrar elevações
+        elevations = []
+        for i in range(num_points):
+            row, col = src.index(x[i], y[i])
+            if 0 <= row < src.height and 0 <= col < src.width:
+                elevation = src.read(1, window=((row, row+1), (col, col+1)))[0, 0]
+                elevations.append(elevation)
+            else:
+                elevations.append(np.nan)
+        
+        return distances, np.array(elevations)
+
+# Criar alguns perfis de terreno
+with rasterio.open(dem_path) as src:
+    width, height = src.width, src.height
+    profiles = [
+        ((width * 0.1, height * 0.1), (width * 0.9, height * 0.9)),  # Diagonal
+        ((width * 0.1, height * 0.5), (width * 0.9, height * 0.5)),  # Horizontal
+        ((width * 0.5, height * 0.1), (width * 0.5, height * 0.9)),  # Vertical
+    ]
+
+# Plotar perfis
+fig, axes = plt.subplots(len(profiles), 1, figsize=(12, 4*len(profiles)))
+
+for i, (start, end) in enumerate(profiles):
+    distances, elevations = create_terrain_profile(dem_path, start, end)
+    
+    # Plotar perfil
+    ax = axes[i] if len(profiles) > 1 else axes
+    ax.plot(distances, elevations)
+    ax.set_xlabel('Distância')
+    ax.set_ylabel('Elevação (m)')
+    ax.set_title(f'Perfil de Terreno {i+1}')
+    ax.grid(True)
+
+plt.tight_layout()
+plt.savefig('/content/output/terrain_profiles.png', dpi=300)
+plt.show()
+
+# Liberar memória
+clear_memory()
+
+# --- 7. Integração com Análise de ERBs ---
+
+# Gerar ERBs aleatórias
+def generate_sample_erbs(n=30, dem_path=None):
+    """Gerar dados de ERBs de exemplo."""
+    np.random.seed(42)
+    
+    # Obter limites do DEM
+    with rasterio.open(dem_path) as src:
+        width, height = src.width, src.height
+    
+    # Gerar dados
+    data = {
+        'nome_erb': [f'ERB-{i}' for i in range(n)],
+        'x': np.random.uniform(0, width, n),
+        'y': np.random.uniform(0, height, n),
+        'operadora': np.random.choice(['Operadora A', 'Operadora B', 'Operadora C'], n),
+        'potencia_watts': np.random.uniform(10, 40, n),
+        'ganho_antena': np.random.uniform(10, 18, n),
+        'frequencia_mhz': np.random.choice([700, 850, 1800, 2100, 2600, 3500], n),
+        'altura_m': np.random.uniform(20, 50, n),
+        'azimute': np.random.uniform(0, 360, n),
+    }
+    
+    # Criar DataFrame
+    df = pd.DataFrame(data)
+    
+    # Amostrar elevação do terreno para cada ERB
+    elevations = []
+    with rasterio.open(dem_path) as src:
+        for i in range(n):
+            x, y = df['x'][i], df['y'][i]
+            row, col = int(y), int(x)  # Posição em pixels
+            if 0 <= row < height and 0 <= col < width:
+                elev = src.read(1, window=((row, row+1), (col, col+1)))[0, 0]
+                elevations.append(elev)
+            else:
+                elevations.append(0)
+    
+    df['elevacao_m'] = elevations
+    
+    # Criar geometria
+    geometry = [Point(x, y) for x, y in zip(df['x'], df['y'])]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry)
+    
+    return gdf
+
+# Gerar ERBs
+erbs_gdf = generate_sample_erbs(30, dem_path)
+
+# Calcular parâmetros de cobertura
+erbs_gdf['eirp'] = erbs_gdf['potencia_watts'] * erbs_gdf['ganho_antena']
+erbs_gdf['raio_km'] = erbs_gdf['eirp'].apply(lambda x: min(5, np.sqrt(x) / 10))  # Simplificado
+
+# Visualizar ERBs sobre o terreno
+fig, ax = plt.subplots(figsize=(12, 10))
+
+# Plotar hillshade
+with rasterio.open(hillshade_path) as src:
+    hillshade = src.read(1)
+    ax.imshow(hillshade, cmap='gray', alpha=0.7)
+
+# Plotar declividade
+with rasterio.open(slope_path) as src:
+    slope = src.read(1)
+    ax.imshow(slope, cmap='viridis', alpha=0.3)
+
+# Plotar ERBs
+scatter = ax.scatter(
+    erbs_gdf['x'], 
+    erbs_gdf['y'],
+    c=erbs_gdf['eirp'],
+    cmap='hot',
+    s=100,
+    alpha=0.8,
+    edgecolors='black'
+)
+
+# Adicionar colorbar
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('EIRP')
+
+# Adicionar círculos de cobertura
+for idx, row in erbs_gdf.iterrows():
+    circle = plt.Circle(
+        (row['x'], row['y']), 
+        row['raio_km'] * 20,  # Escala para visualização
+        color=plt.cm.hot(row['eirp'] / erbs_gdf['eirp'].max()),
+        alpha=0.2,
+        fill=True
+    )
+    ax.add_patch(circle)
+
+ax.set_title('ERBs sobre Análise de Terreno')
+plt.savefig('/content/output/erbs_on_terrain.png', dpi=300)
+plt.show()
+
+# Liberar memória
+clear_memory()
+
+# --- 8. Cobertura de ERBs ajustada ao Terreno ---
+
+def adjust_coverage_for_terrain(erbs_gdf, dem_path, hillshade_path, max_samples=1000):
+    """Ajusta a cobertura de ERBs considerando a topografia do terreno."""
+    # Resultados
+    combined_viewshed = None
+    
+    # Abrir DEM para obter tamanho
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1)
+        combined_viewshed = np.zeros_like(dem, dtype=np.uint8)
+        meta = src.meta.copy()
+    
+    # Calcular viewshed para cada ERB (limitado por max_samples)
+    sample_size = min(len(erbs_gdf), max_samples)
+    sample_erbs = erbs_gdf.sample(sample_size) if len(erbs_gdf) > max_samples else erbs_gdf
+    
+    # Para cada ERB
+    for idx, row in sample_erbs.iterrows():
+        # Obter coordenadas e altura
+        x, y = row['x'], row['y']
+        height = row['altura_m']
+        
+        # Calcular viewshed
+        with rasterio.open(dem_path) as src:
+            # Converter coordenadas para índices de pixel
+            row_idx, col_idx = int(y), int(x)  # Posição em pixels
+            
+            # Garantir que o ponto está dentro do raster
+            if 0 <= row_idx < dem.shape[0] and 0 <= col_idx < dem.shape[1]:
+                # Calcular viewshed
+                vs = calculate_viewshed(
+                    dem=dem,
+                    observer_row=row_idx,
+                    observer_col=col_idx,
+                    observer_height=height,
+                    max_distance=int(row['raio_km'] * 20)  # Escala para visualização
+                )
+                
+                # Adicionar ao viewshed acumulado
+                combined_viewshed = np.maximum(combined_viewshed, vs)
+    
+    # Salvar viewshed combinado
+    combined_path = dem_path.replace('.tif', '_combined_coverage.tif')
+    with rasterio.open(combined_path, 'w', **meta) as dst:
+        dst.write(combined_viewshed, 1)
+    
+    return combined_path
+
+# Calcular cobertura ajustada ao terreno
+combined_coverage_path = adjust_coverage_for_terrain(erbs_gdf, dem_path, hillshade_path)
+
+# Visualizar cobertura ajustada
+fig, ax = plt.subplots(figsize=(12, 10))
+
+# Plotar hillshade
+with rasterio.open(hillshade_path) as src:
+    hillshade = src.read(1)
+    ax.imshow(hillshade, cmap='gray', alpha=0.7)
+
+# Plotar cobertura
+with rasterio.open(combined_coverage_path) as src:
+    coverage = src.read(1)
+    ax.imshow(coverage, cmap='plasma', alpha=0.6)
+
+# Plotar ERBs
+ax.scatter(
+    erbs_gdf['x'], 
+    erbs_gdf['y'],
+    c=erbs_gdf['eirp'],
+    cmap='hot',
+    s=100,
+    alpha=0.8,
+    edgecolors='black'
+)
+
+ax.set_title('Cobertura de ERBs Ajustada ao Terreno')
+plt.savefig('/content/output/terrain_adjusted_coverage.png', dpi=300)
+plt.show()
+
+# Liberar memória
+clear_memory()
+
+# --- 9. Exportar Resultados ---
+
+# Exportar resultados para o Drive (opcional)
+import os
+import shutil
+
+# Definir diretório no Drive
+drive_output_dir = '/content/drive/MyDrive/grapho_terrain_results/terrain'
+os.makedirs(drive_output_dir, exist_ok=True)
+
+# Copiar resultados
+for filename in os.listdir('/content/output'):
+    if filename.endswith('.png'):  # Copiar apenas imagens
+        src = os.path.join('/content/output', filename)
+        dst = os.path.join(drive_output_dir, filename)
+        shutil.copy2(src, dst)
+
+print(f"Resultados exportados para: {drive_output_dir}") 

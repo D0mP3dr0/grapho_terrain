@@ -1,0 +1,614 @@
+# Grapho Terrain - Análise de ERBs
+# Este notebook implementa análises completas de ERBs (Estações Rádio Base) utilizando a biblioteca grapho_terrain
+
+# --- 1. Configuração do Ambiente ---
+
+# Montar o Google Drive (opcional)
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Criar diretório para output
+!mkdir -p /content/output
+
+# Instalação das dependências
+!pip install numpy pandas geopandas matplotlib shapely folium contextily rtree pyproj h3 networkx
+!pip install torch==2.0.1 torchvision==0.15.2
+!pip install torch-scatter torch-sparse torch-cluster torch-geometric -f https://data.pyg.org/whl/torch-2.0.1+cu118.html
+
+# Clonar o repositório grapho_terrain
+!git clone https://github.com/D0mP3dr0/grapho_terrain.git
+!cd grapho_terrain && pip install -e .
+
+import os
+import gc
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import networkx as nx
+from shapely.geometry import Point, Polygon
+
+# Importar módulos do grapho_terrain
+from grapho_terrain.telecommunications.erb import ERB
+from grapho_terrain.telecommunications.coverage import (
+    calcular_eirp, 
+    calcular_raio_cobertura_aprimorado, 
+    criar_setor_preciso
+)
+from grapho_terrain.telecommunications.network import (
+    create_network_graph, 
+    analyze_network_metrics
+)
+from grapho_terrain.network.feature_graphs import FeatureGeoGraph, MultiLayerFeatureGraph
+
+# Configurações para evitar warnings
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configurar para utilizar GPU se disponível
+import torch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando: {device}")
+
+# --- 2. Funções para Otimização de Memória ---
+
+def process_in_batches(df, batch_size=1000, func=None):
+    """Processa um DataFrame em lotes para economizar memória."""
+    results = []
+    for i in range(0, len(df), batch_size):
+        batch = df.iloc[i:i+batch_size].copy()
+        if func:
+            batch_result = func(batch)
+            results.append(batch_result)
+        else:
+            results.append(batch)
+    
+    if func:
+        # Combinar resultados depende do tipo de retorno da função
+        if isinstance(results[0], pd.DataFrame) or isinstance(results[0], gpd.GeoDataFrame):
+            return pd.concat(results, ignore_index=True)
+        else:
+            return results
+    else:
+        return pd.concat(results, ignore_index=True)
+
+def clear_memory():
+    """Libera memória não utilizada."""
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+# --- 3. Carregamento de Dados ---
+
+# Função para gerar dados de exemplo
+def generate_sample_erbs(n=500, seed=42):
+    """Gerar dados de ERBs de exemplo."""
+    np.random.seed(seed)
+    
+    # Coordenadas centradas em São Paulo
+    center_lat, center_lon = -23.55, -46.63
+    
+    # Gerar dados
+    data = {
+        'nome_erb': [f'ERB-{i}' for i in range(n)],
+        'latitude': center_lat + np.random.normal(0, 0.05, n),
+        'longitude': center_lon + np.random.normal(0, 0.05, n),
+        'operadora': np.random.choice(['Operadora A', 'Operadora B', 'Operadora C', 'Operadora D'], n),
+        'potencia_watts': np.random.uniform(10, 40, n),
+        'ganho_antena': np.random.uniform(10, 18, n),
+        'frequencia_mhz': np.random.choice([700, 850, 1800, 2100, 2600, 3500], n),
+        'altura_m': np.random.uniform(20, 50, n),
+        'azimute': np.random.uniform(0, 360, n),
+        'tipo_area': np.random.choice(['urbana', 'suburbana', 'rural'], n, p=[0.7, 0.2, 0.1]),
+    }
+    
+    # Criar DataFrame
+    df = pd.DataFrame(data)
+    
+    # Criar GeoDataFrame
+    geometry = [Point(lon, lat) for lon, lat in zip(df['longitude'], df['latitude'])]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+    
+    return gdf
+
+# Carregar dados
+# Opção 1: Carregar do Drive
+# erbs_file = '/content/drive/MyDrive/dados/erbs.csv'
+# erbs_df = pd.read_csv(erbs_file)
+# geometry = [Point(lon, lat) for lon, lat in zip(erbs_df['longitude'], erbs_df['latitude'])]
+# erbs_gdf = gpd.GeoDataFrame(erbs_df, geometry=geometry, crs="EPSG:4326")
+
+# Opção 2: Usar dados de exemplo
+erbs_gdf = generate_sample_erbs(500)
+erbs_gdf.head()
+
+# --- 4. Análise de Cobertura de ERBs ---
+
+# Calcular EIRP e raio de cobertura
+def process_erb_coverage(gdf):
+    gdf = gdf.copy()
+    # Calcular EIRP
+    gdf['eirp'] = gdf.apply(lambda row: calcular_eirp(row['potencia_watts'], row['ganho_antena']), axis=1)
+    
+    # Calcular raio de cobertura
+    gdf['raio_km'] = gdf.apply(
+        lambda row: calcular_raio_cobertura_aprimorado(row['eirp'], row['frequencia_mhz'], row['tipo_area']), 
+        axis=1
+    )
+    return gdf
+
+# Processar em lotes para economizar memória
+erbs_gdf = process_in_batches(erbs_gdf, batch_size=100, func=process_erb_coverage)
+erbs_gdf.head()
+
+# Criar setores de cobertura
+def create_coverage_sectors(gdf, sample_size=None):
+    # Opcionalmente amostrar para reduzir carga de memória
+    if sample_size and len(gdf) > sample_size:
+        gdf_sample = gdf.sample(sample_size, random_state=42)
+    else:
+        gdf_sample = gdf.copy()
+    
+    # Criar setores
+    sectors = []
+    for idx, row in gdf_sample.iterrows():
+        try:
+            setor = criar_setor_preciso(
+                lat=row['latitude'],
+                lon=row['longitude'],
+                raio=row['raio_km'],
+                azimute=row['azimute'],
+                angulo=120,  # Típico setor de 120 graus
+                resolucao=12  # Reduzido para economizar memória
+            )
+            sectors.append({
+                'erb_id': idx,
+                'operadora': row['operadora'],
+                'eirp': row['eirp'],
+                'geometry': setor
+            })
+        except Exception as e:
+            print(f"Erro ao criar setor para ERB {idx}: {e}")
+    
+    # Criar GeoDataFrame dos setores
+    sectors_gdf = gpd.GeoDataFrame(sectors, crs="EPSG:4326")
+    return sectors_gdf
+
+# Criar setores (limitando a 200 para economizar memória)
+sectors_gdf = create_coverage_sectors(erbs_gdf, sample_size=200)
+sectors_gdf.head()
+
+# --- 5. Visualização Básica ---
+
+def visualize_erbs_coverage(erbs_gdf, sectors_gdf, title="Cobertura de ERBs"):
+    # Criar figura
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Plotar setores por operadora
+    operators = sectors_gdf['operadora'].unique()
+    colors = plt.cm.tab10(np.linspace(0, 1, len(operators)))
+    
+    for i, operator in enumerate(operators):
+        operator_sectors = sectors_gdf[sectors_gdf['operadora'] == operator]
+        operator_sectors.plot(
+            ax=ax, 
+            alpha=0.3, 
+            color=colors[i],
+            label=operator
+        )
+    
+    # Plotar ERBs
+    erbs_gdf.plot(
+        ax=ax,
+        markersize=15,
+        color='black',
+        marker='^',
+        label='ERBs'
+    )
+    
+    # Adicionar elementos cartográficos
+    ax.set_title(title, fontsize=16)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    ax.grid(True)
+    
+    plt.tight_layout()
+    return fig, ax
+
+# Visualizar
+fig, ax = visualize_erbs_coverage(erbs_gdf, sectors_gdf)
+plt.savefig('/content/output/erbs_coverage.png', dpi=300)
+plt.show()
+
+# --- 6. Análise de Rede (Grafo) ---
+
+# Criar grafo de rede
+def create_and_analyze_network(erbs_gdf, max_distance_km=5.0):
+    # Converter para projeção métrica para cálculo de distância
+    erbs_proj = erbs_gdf.copy()
+    if erbs_proj.crs != "EPSG:3857":
+        erbs_proj = erbs_proj.to_crs("EPSG:3857")
+    
+    # Criar grafo - as ERBs são os nós e as arestas são criadas se estiverem dentro da distância máxima
+    # Usando classe FeatureGeoGraph
+    graph = FeatureGeoGraph()
+    
+    # Adicionar nós
+    for idx, row in erbs_proj.iterrows():
+        graph.add_node(idx, geometry=row.geometry, **{
+            'operadora': row['operadora'],
+            'potencia': row['potencia_watts'],
+            'frequencia': row['frequencia_mhz'],
+            'altura': row['altura_m'],
+            'eirp': row['eirp'],
+            'raio_cobertura': row['raio_km']
+        })
+    
+    # Adicionar arestas baseadas na distância
+    nodes = list(graph.nodes())
+    for i, node1 in enumerate(nodes):
+        geom1 = graph.nodes[node1]['geometry']
+        for node2 in nodes[i+1:]:
+            geom2 = graph.nodes[node2]['geometry']
+            distance = geom1.distance(geom2) / 1000  # Converter para km
+            if distance <= max_distance_km:
+                graph.add_edge(node1, node2, distance=distance)
+    
+    # Analisar métricas
+    metrics = {
+        'num_nodes': graph.number_of_nodes(),
+        'num_edges': graph.number_of_edges(),
+        'density': nx.density(graph),
+        'avg_degree': sum(dict(graph.degree()).values()) / graph.number_of_nodes(),
+        'connected_components': nx.number_connected_components(graph),
+    }
+    
+    # Adicionar centralidades (computacionalmente intensivo)
+    # Calcular apenas para grafos menores
+    if graph.number_of_nodes() <= 200:
+        try:
+            degree_centrality = nx.degree_centrality(graph)
+            betweenness_centrality = nx.betweenness_centrality(graph)
+            metrics['avg_degree_centrality'] = sum(degree_centrality.values()) / len(degree_centrality)
+            metrics['avg_betweenness_centrality'] = sum(betweenness_centrality.values()) / len(betweenness_centrality)
+        except Exception as e:
+            print(f"Erro ao calcular centralidades: {e}")
+    
+    return graph, metrics
+
+# Criar e analisar rede
+erb_graph, metrics = create_and_analyze_network(erbs_gdf)
+
+# Mostrar métricas
+for metric, value in metrics.items():
+    print(f"{metric}: {value}")
+
+# Criar visualização do grafo
+plt.figure(figsize=(12, 10))
+pos = {node: (erb_graph.nodes[node]['geometry'].x, erb_graph.nodes[node]['geometry'].y) for node in erb_graph.nodes()}
+nx.draw_networkx(erb_graph, pos=pos, node_size=30, alpha=0.7, with_labels=False)
+plt.title("Grafo de Conectividade de ERBs")
+plt.savefig('/content/output/erb_network_graph.png', dpi=300)
+plt.show()
+
+# Liberar memória
+clear_memory()
+
+# --- 7. Conversão para PyTorch Geometric ---
+
+def convert_to_pytorch_geometric(graph):
+    # Criar feature matrix para nós
+    node_features = []
+    node_id_map = {}
+    
+    # Extrair features numéricas dos nós
+    numeric_features = ['potencia', 'frequencia', 'altura', 'eirp', 'raio_cobertura']
+    
+    for i, node in enumerate(graph.nodes()):
+        node_id_map[node] = i
+        features = [float(graph.nodes[node].get(feat, 0.0)) for feat in numeric_features]
+        node_features.append(features)
+    
+    # Converter para tensor
+    node_features_tensor = torch.tensor(node_features, dtype=torch.float)
+    
+    # Criar edge index
+    edge_index = []
+    edge_attr = []
+    
+    for u, v, data in graph.edges(data=True):
+        edge_index.append([node_id_map[u], node_id_map[v]])
+        edge_index.append([node_id_map[v], node_id_map[u]])  # Adicionar edge reversa (grafo não direcionado)
+        edge_attr.append([data.get('distance', 1.0)])
+        edge_attr.append([data.get('distance', 1.0)])  # Para a edge reversa
+    
+    # Converter para tensores
+    if edge_index:
+        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        edge_attr_tensor = torch.tensor(edge_attr, dtype=torch.float)
+    else:
+        edge_index_tensor = torch.zeros((2, 0), dtype=torch.long)
+        edge_attr_tensor = torch.zeros((0, 1), dtype=torch.float)
+    
+    # Criar Data object
+    from torch_geometric.data import Data
+    data = Data(
+        x=node_features_tensor,
+        edge_index=edge_index_tensor,
+        edge_attr=edge_attr_tensor
+    )
+    
+    return data
+
+# Converter grafo para PyTorch Geometric
+try:
+    pyg_data = convert_to_pytorch_geometric(erb_graph)
+    print(f"PyTorch Geometric Data:")
+    print(f"Node features: {pyg_data.x.shape}")
+    print(f"Edge index: {pyg_data.edge_index.shape}")
+    print(f"Edge attributes: {pyg_data.edge_attr.shape}")
+    
+    # Mover para GPU se disponível
+    pyg_data = pyg_data.to(device)
+except Exception as e:
+    print(f"Erro ao converter para PyTorch Geometric: {e}")
+
+# --- 8. Multi-Layer Graph (Grafo Multi-Camada) ---
+
+# Criando dados sintéticos para demonstração de grafo multi-camada
+def create_sample_layers(num_buildings=100, num_roads=20, num_erbs=50, boundary=None):
+    """Criar camadas amostrais para edificações, vias e ERBs."""
+    if boundary is None:
+        # Usar limites das ERBs existentes
+        minx, miny, maxx, maxy = erbs_gdf.total_bounds
+        boundary = (minx, miny, maxx, maxy)
+    else:
+        minx, miny, maxx, maxy = boundary
+    
+    # Criar edificações
+    from shapely.geometry import Polygon
+    buildings = []
+    for i in range(num_buildings):
+        # Gerar ponto central aleatório
+        cx = np.random.uniform(minx, maxx)
+        cy = np.random.uniform(miny, maxy)
+        
+        # Tamanho aleatório
+        width = np.random.uniform(0.0005, 0.002)
+        height = np.random.uniform(0.0005, 0.002)
+        
+        # Criar polígono
+        polygon = Polygon([
+            (cx - width/2, cy - height/2),
+            (cx + width/2, cy - height/2),
+            (cx + width/2, cy + height/2),
+            (cx - width/2, cy + height/2)
+        ])
+        
+        # Adicionar atributos
+        buildings.append({
+            'id': f'B{i}',
+            'type': np.random.choice(['residential', 'commercial', 'industrial']),
+            'height': np.random.uniform(5, 50),
+            'area': polygon.area * 111000, # Conversão aproximada para m²
+            'geometry': polygon
+        })
+    
+    # Criar vias
+    from shapely.geometry import LineString
+    roads = []
+    for i in range(num_roads):
+        # Pontos inicial e final
+        x1, y1 = np.random.uniform(minx, maxx), np.random.uniform(miny, maxy)
+        angle = np.random.uniform(0, 2*np.pi)
+        length = np.random.uniform(0.01, 0.05)
+        x2 = x1 + length * np.cos(angle)
+        y2 = y1 + length * np.sin(angle)
+        
+        # Criar linha
+        line = LineString([(x1, y1), (x2, y2)])
+        
+        # Adicionar atributos
+        roads.append({
+            'id': f'R{i}',
+            'type': np.random.choice(['highway', 'primary', 'secondary', 'residential']),
+            'lanes': np.random.randint(1, 5),
+            'length': line.length * 111000, # Conversão aproximada para metros
+            'geometry': line
+        })
+    
+    # Usar ERBs existentes ou criar novas
+    if 'erbs_gdf' in globals() and len(erbs_gdf) >= num_erbs:
+        erbs_sample = erbs_gdf.sample(num_erbs).copy()
+        erbs_layer = erbs_sample.to_crs("EPSG:4326")
+    else:
+        erbs_layer = generate_sample_erbs(num_erbs)
+    
+    # Criar GeoDataFrames
+    buildings_gdf = gpd.GeoDataFrame(buildings, crs="EPSG:4326")
+    roads_gdf = gpd.GeoDataFrame(roads, crs="EPSG:4326")
+    
+    return buildings_gdf, roads_gdf, erbs_layer
+
+# Criar camadas
+buildings_gdf, roads_gdf, erbs_layer = create_sample_layers()
+
+# Mostrar primeiras linhas
+print("Edificações:")
+display(buildings_gdf.head(3))
+
+print("\nVias:")
+display(roads_gdf.head(3))
+
+print("\nERBs:")
+display(erbs_layer.head(3))
+
+# Criar e visualizar grafo multicamada
+def create_multilayer_graph(buildings_gdf, roads_gdf, erbs_gdf):
+    # Criar grafo multi-camada
+    mlg = MultiLayerFeatureGraph()
+    
+    # Adicionar camada de edificações
+    building_features = {
+        'numeric': ['height', 'area'],
+        'categorical': ['type']
+    }
+    mlg.add_layer_from_gdf('buildings', buildings_gdf, building_features, id_column='id')
+    
+    # Adicionar camada de vias
+    road_features = {
+        'numeric': ['lanes', 'length'],
+        'categorical': ['type']
+    }
+    mlg.add_layer_from_gdf('roads', roads_gdf, road_features, id_column='id')
+    
+    # Adicionar camada de ERBs
+    erb_features = {
+        'numeric': ['potencia_watts', 'ganho_antena', 'frequencia_mhz', 'altura_m', 'raio_km'],
+        'categorical': ['operadora', 'tipo_area']
+    }
+    mlg.add_layer_from_gdf('erbs', erbs_gdf, erb_features)
+    
+    # Adicionar conexões entre camadas
+    # Conectar edificações às vias próximas
+    mlg.add_interlayer_edges('buildings', 'roads', max_distance=0.005)  # ~500m
+    
+    # Conectar ERBs às edificações (para análise de cobertura)
+    mlg.add_interlayer_edges('erbs', 'buildings', max_distance=0.01)  # ~1km
+    
+    # Conectar ERBs às vias (para análise de infraestrutura)
+    mlg.add_interlayer_edges('erbs', 'roads', max_distance=0.01)  # ~1km
+    
+    # Calcular métricas por camada
+    metrics = {}
+    for layer in mlg.layers:
+        g = mlg.layers[layer]['graph']
+        metrics[layer] = {
+            'nodes': g.number_of_nodes(),
+            'edges': g.number_of_edges(),
+            'density': nx.density(g) if g.number_of_nodes() > 1 else 0
+        }
+    
+    # Calcular métricas de conexões entre camadas
+    for layer1, layer2 in mlg.interlayer_edges:
+        edges = mlg.interlayer_edges[(layer1, layer2)]
+        metrics[f"{layer1}-{layer2}"] = {
+            'connections': len(edges)
+        }
+    
+    return mlg, metrics
+
+# Criar grafo multicamada
+mlg, mlg_metrics = create_multilayer_graph(buildings_gdf, roads_gdf, erbs_layer)
+
+# Mostrar métricas
+for layer, layer_metrics in mlg_metrics.items():
+    print(f"\n{layer}:")
+    for metric, value in layer_metrics.items():
+        print(f"  {metric}: {value}")
+
+# Visualizar
+plt.figure(figsize=(15, 12))
+
+# Plotar camadas
+ax = plt.subplot(111)
+buildings_gdf.plot(ax=ax, color='lightgray', alpha=0.6, label='Edificações')
+roads_gdf.plot(ax=ax, color='black', alpha=0.7, label='Vias')
+erbs_layer.plot(ax=ax, color='red', markersize=50, marker='^', alpha=0.8, label='ERBs')
+
+plt.title("Camadas do Grafo Multi-Camada", fontsize=16)
+plt.legend()
+plt.savefig('/content/output/multilayer_graph.png', dpi=300)
+plt.show()
+
+# Liberar memória
+clear_memory()
+
+# --- 9. Conversão para PyTorch Geometric HeteroData ---
+
+def convert_to_hetero_data(mlg):
+    from torch_geometric.data import HeteroData
+    
+    # Criar objeto HeteroData
+    data = HeteroData()
+    
+    # Adicionar nós e atributos para cada camada
+    for layer_name, layer_info in mlg.layers.items():
+        # Obter grafo da camada
+        g = layer_info['graph']
+        
+        # Obter atributos numéricos e categóricos
+        numeric_features = layer_info.get('numeric_features', [])
+        categorical_features = layer_info.get('categorical_features', [])
+        
+        # Criar tensores de nós
+        if numeric_features:
+            # Obter matriz de features
+            feature_matrix = mlg.get_feature_matrix(layer_name, feature_type='numeric')
+            
+            # Adicionar ao HeteroData
+            data[layer_name].x = torch.tensor(feature_matrix, dtype=torch.float)
+        else:
+            # Criar tensor vazio
+            data[layer_name].x = torch.zeros((g.number_of_nodes(), 1), dtype=torch.float)
+        
+        # Mapear IDs de nós para índices em cada camada
+        node_mapping = {node: i for i, node in enumerate(g.nodes())}
+        
+        # Adicionar edge index intra-camada
+        edge_list = []
+        for u, v in g.edges():
+            # Mapear IDs para índices
+            edge_list.append([node_mapping[u], node_mapping[v]])
+            edge_list.append([node_mapping[v], node_mapping[u]])  # Grafo não direcionado
+        
+        # Adicionar ao HeteroData se houver arestas
+        if edge_list:
+            data[layer_name, 'connects', layer_name].edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+    
+    # Adicionar edge index entre camadas
+    for (layer1, layer2), edges in mlg.interlayer_edges.items():
+        edge_list = []
+        
+        # Obter mapeamentos de nós para cada camada
+        node_mapping1 = {node: i for i, node in enumerate(mlg.layers[layer1]['graph'].nodes())}
+        node_mapping2 = {node: i for i, node in enumerate(mlg.layers[layer2]['graph'].nodes())}
+        
+        # Adicionar arestas entre camadas
+        for u, v in edges:
+            edge_list.append([node_mapping1[u], node_mapping2[v]])
+        
+        # Adicionar ao HeteroData se houver arestas
+        if edge_list:
+            data[layer1, 'connects', layer2].edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+    
+    return data
+
+# Converter para PyTorch Geometric HeteroData
+try:
+    hetero_data = convert_to_hetero_data(mlg)
+    print("PyTorch Geometric HeteroData:")
+    print(hetero_data)
+    
+    # Mover para GPU se disponível
+    hetero_data = hetero_data.to(device)
+except Exception as e:
+    print(f"Erro ao converter para PyTorch Geometric HeteroData: {e}")
+
+# --- 10. Exportar Resultados ---
+
+# Exportar resultados para o Drive (opcional)
+import os
+import shutil
+
+# Definir diretório no Drive
+drive_output_dir = '/content/drive/MyDrive/grapho_terrain_results/erbs'
+os.makedirs(drive_output_dir, exist_ok=True)
+
+# Copiar resultados
+for filename in os.listdir('/content/output'):
+    src = os.path.join('/content/output', filename)
+    dst = os.path.join(drive_output_dir, filename)
+    shutil.copy2(src, dst)
+
+print(f"Resultados exportados para: {drive_output_dir}") 
