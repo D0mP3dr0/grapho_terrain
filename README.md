@@ -14,6 +14,8 @@ Grapho Terrain is a research tool for creating, analyzing, and visualizing heter
 - **Graph Construction**: Create multi-layered graphs from heterogeneous geospatial data
 - **3D Visualization**: Advanced visualization tools for terrain, urban features, and analytical results
 - **Population Analysis**: Tools for modeling population distribution across space and time
+- **Integrated Pipeline**: End-to-end workflow from data loading to graph analysis and visualization
+- **Telecommunications Analysis**: ERB (Radio Base Station) coverage analysis and network modeling
 
 ## Installation
 
@@ -28,7 +30,7 @@ pip install -e .
 
 ## Usage
 
-Basic usage example:
+### Basic Usage
 
 ```python
 import grapho_terrain as gt
@@ -43,7 +45,25 @@ dem = gt.processing.create_dem_from_contours(contours, resolution=30)
 gt.visualization.visualize_terrain_3d(dem, title="3D Terrain Model")
 ```
 
-Check the examples directory for more detailed usage examples.
+### Using the Complete Pipeline
+
+For a complete end-to-end workflow, use one of our pipeline scripts:
+
+```bash
+# Run the simplified pipeline (recommended for first-time users)
+python examples/pipeline_simples.py
+
+# Generate synthetic test data automatically
+python examples/pipeline_simples.py
+
+# Use the comprehensive pipeline (requires all dependencies)
+python examples/pipeline_completo.py --config examples/pipeline_config.json
+
+# Use the Sorocaba ERB example
+python examples/pipeline_completo.py --sorocaba
+```
+
+See `examples/README_pipeline.md` for complete documentation on the pipeline.
 
 ## Project Structure
 
@@ -55,12 +75,19 @@ grapho_terrain/
 │   ├── processing/        # Data processing modules
 │   ├── visualization/     # Visualization tools
 │   ├── network/           # Graph/network analysis
+│   ├── telecommunications/ # ERB and telecom analysis
+│   ├── pipeline/          # Integrated workflow components
 │   └── utils/             # Utility functions
 ├── data/                  # Data directory
 │   ├── raw/               # Raw data files
 │   └── processed/         # Processed data files
 ├── docs/                  # Documentation
 ├── examples/              # Example usage scripts
+│   ├── pipeline_completo.py  # Complete integrated pipeline
+│   ├── pipeline_simples.py   # Simplified pipeline
+│   ├── sorocaba/          # Sorocaba ERB examples
+│   └── README_pipeline.md # Pipeline documentation
+├── output/                # Generated outputs
 └── tests/                 # Test suite
 ```
 

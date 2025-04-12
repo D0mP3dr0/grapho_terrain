@@ -1,0 +1,142 @@
+{
+    "steps": [
+        {
+            "name": "load_data",
+            "enabled": true,
+            "params": {
+                "data_directory": "data/raw",
+                "file_format": "gpkg",
+                "layers": ["buildings", "roads", "erbs"]
+            }
+        },
+        {
+            "name": "preprocess_layers",
+            "enabled": true,
+            "params": {
+                "output_directory": "data/processed",
+                "layers": {
+                    "erbs": {
+                        "numeric_features": [
+                            "potencia_watts", "ganho_antena", "freq_mhz", 
+                            "altura_m", "eirp", "raio_km"
+                        ],
+                        "categorical_features": [
+                            "operadora", "tecnologia"
+                        ],
+                        "create_buffer": true,
+                        "buffer_distance": 0.01
+                    },
+                    "buildings": {
+                        "numeric_features": [
+                            "altura", "area"
+                        ],
+                        "categorical_features": [
+                            "tipo"
+                        ],
+                        "simplify_geometry": true,
+                        "create_centroids": true
+                    },
+                    "roads": {
+                        "numeric_features": [
+                            "largura"
+                        ],
+                        "categorical_features": [
+                            "tipo"
+                        ],
+                        "simplify_geometry": true,
+                        "simplify_tolerance": 0.0001
+                    }
+                }
+            }
+        },
+        {
+            "name": "analyze_erb_coverage",
+            "enabled": true,
+            "params": {
+                "frequencias": {
+                    "700": {"classe": "baixa_freq", "penetracao_indoor": "alta"},
+                    "850": {"classe": "baixa_freq", "penetracao_indoor": "alta"},
+                    "1800": {"classe": "media_freq", "penetracao_indoor": "media"},
+                    "2100": {"classe": "media_freq", "penetracao_indoor": "media"},
+                    "2600": {"classe": "alta_freq", "penetracao_indoor": "baixa"},
+                    "3500": {"classe": "alta_freq", "penetracao_indoor": "muito_baixa"}
+                },
+                "fatores_atenuacao": {
+                    "urbana_densa": 3.0,
+                    "urbana": 2.5,
+                    "suburbana": 2.0,
+                    "rural": 1.5
+                },
+                "gerar_mapa_calor": true,
+                "gerar_mapa_cobertura": true
+            }
+        },
+        {
+            "name": "create_graphs",
+            "enabled": true,
+            "params": {
+                "graph_construction": {
+                    "k_nearest": 5,
+                    "max_distance": 5.0,
+                    "method": "knn",
+                    "weighted": true,
+                    "directed": false
+                },
+                "multi_layer": {
+                    "layers": ["erbs", "buildings", "roads"],
+                    "interlayer_connections": {
+                        "erbs-buildings": {
+                            "method": "distance",
+                            "max_distance": 0.5
+                        },
+                        "buildings-roads": {
+                            "method": "nearest",
+                            "k": 2
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "name": "analyze_graphs",
+            "enabled": true,
+            "params": {
+                "metrics": {
+                    "basic": [
+                        "num_nodes", "num_edges", "density", "avg_degree", 
+                        "avg_clustering", "diameter", "avg_path_length"
+                    ],
+                    "centrality": [
+                        "degree_centrality", "betweenness_centrality", 
+                        "closeness_centrality", "eigenvector_centrality"
+                    ],
+                    "community": ["louvain"]
+                }
+            }
+        },
+        {
+            "name": "visualize_results",
+            "enabled": true,
+            "params": {
+                "output_directory": "output/visualizations",
+                "interactive": true,
+                "static": true,
+                "formats": ["png", "html"]
+            }
+        },
+        {
+            "name": "export_results",
+            "enabled": true,
+            "params": {
+                "formats": ["gpkg", "csv", "json"],
+                "output_directory": "output/results"
+            }
+        }
+    ],
+    "parallel": false,
+    "logger": {
+        "level": "INFO",
+        "file": "logs/pipeline.log",
+        "console": true
+    }
+} 
