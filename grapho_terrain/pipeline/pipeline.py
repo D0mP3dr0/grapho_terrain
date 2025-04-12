@@ -961,4 +961,47 @@ class Pipeline:
             
         except Exception as e:
             self.logger.error(f"Erro ao carregar contexto: {e}")
-            return False 
+            return False
+
+
+if __name__ == '__main__':
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+
+    logger.info("="*30 + " INICIANDO TESTE DO PIPELINE " + "="*30)
+
+    # Configuração padrão (pode ser personalizada aqui ou via arquivo JSON)
+    # Usará 'data/raw' como diretório de dados padrão
+    # e tentará carregar arquivos .gpkg de lá
+    config = {
+        "stop_on_error": False, # Continuar mesmo se um passo falhar
+        "steps": {
+            # Exemplo de como desabilitar um passo:
+            # { "name": "analyze_erb_coverage", "enabled": False },
+            # Exemplo de como passar parâmetros para um passo:
+            # { "name": "create_graphs", "params": { "multilayer": True, "graph_types": ["roads"] } }
+        },
+        # Adicione outras configurações globais aqui se necessário
+        "global_param_exemplo": "valor_exemplo"
+    }
+
+    # Instanciar e executar o pipeline
+    try:
+        pipeline_instance = Pipeline(config=config)
+        pipeline_context = pipeline_instance.run()
+
+        logger.info("="*30 + " TESTE DO PIPELINE CONCLUÍDO " + "="*30)
+
+        # Opcional: inspecionar o contexto final
+        # logger.info("\nContexto final do pipeline:")
+        # for key, value in pipeline_context.items():
+        #     if isinstance(value, (dict, list)):
+        #         logger.info(f" - {key}: (Tipo: {type(value).__name__}, Itens: {len(value)})")
+        #     else:
+        #          logger.info(f" - {key}: {value}")
+
+    except Exception as main_error:
+        logger.error(f"Erro fatal durante a execução do pipeline: {main_error}")
+        import traceback
+        logger.error(traceback.format_exc()) 

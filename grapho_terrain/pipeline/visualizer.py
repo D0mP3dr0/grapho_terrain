@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple, Union, Optional, Any
 import contextily as ctx
 from shapely.geometry import Point, LineString, Polygon
 
-from ..network.geo_graph import GeoGraph
+from ..core.graph import GeoGraph
 from ..network.feature_graphs import FeatureGeoGraph, MultiLayerFeatureGraph
 from ..telecommunications.erb import ERB
 
@@ -126,7 +126,7 @@ class Visualizer:
         return ax
     
     def plot_points(self, gdf: gpd.GeoDataFrame, ax: plt.Axes = None,
-                   column: str = None, cmap: str = 'viridis',
+                   column: str = None, color: str = None, cmap: str = 'viridis',
                    marker: str = 'o', size: int = 50,
                    legend: bool = True, title: str = None, **kwargs) -> plt.Axes:
         """
@@ -136,7 +136,8 @@ class Visualizer:
             gdf: GeoDataFrame com pontos
             ax: Eixo do matplotlib (se None, cria um novo)
             column: Coluna para colorir os pontos
-            cmap: Mapa de cores
+            color: Cor dos pontos (ignorado se column for especificado)
+            cmap: Mapa de cores (usado apenas se column for especificado)
             marker: Símbolo do marcador
             size: Tamanho dos pontos
             legend: Se True, adiciona uma legenda
@@ -158,9 +159,25 @@ class Visualizer:
         if not all(geom.geom_type == 'Point' for geom in point_gdf.geometry):
             point_gdf.geometry = point_gdf.geometry.centroid
             
+        # Prepara os argumentos de plotagem
+        plot_kwargs = kwargs.copy()
+        if column is not None:
+            # Se uma coluna for especificada, usa ela para colorir
+            plot_kwargs.update({
+                'column': column,
+                'cmap': cmap,
+                'legend': legend
+            })
+            # Remove color se estiver presente
+            plot_kwargs.pop('color', None)
+        else:
+            # Se não houver coluna, usa a cor especificada
+            if color is not None:
+                plot_kwargs['color'] = color
+            plot_kwargs['legend'] = False
+            
         # Plota os pontos
-        point_gdf.plot(ax=ax, column=column, cmap=cmap, marker=marker, 
-                      markersize=size, legend=legend, **kwargs)
+        point_gdf.plot(ax=ax, marker=marker, markersize=size, **plot_kwargs)
         
         # Adiciona título
         if title:

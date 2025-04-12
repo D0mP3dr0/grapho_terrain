@@ -144,6 +144,141 @@ class ERB(UrbanFeature):
                 
         # Create the sector polygon
         return criar_setor_preciso(lat, lon, raio, self.azimute, resolucao=resolucao)
+        
+    def calculate_signal_strength(self, point, loss_exponent=3.5):
+        """
+        Calculate the signal strength at a specific location.
+        
+        Parameters
+        ----------
+        point : shapely.geometry.Point
+            The location to calculate signal strength at
+        loss_exponent : float, optional
+            Path loss exponent (typically 2.0 to 5.0)
+            
+        Returns
+        -------
+        float or None
+            Received signal strength in dBm, or None if required attributes are missing
+        """
+        if self.geometry is None or point is None:
+            return None
+            
+        # Calculate EIRP
+        eirp = self.calculate_eirp()
+        if eirp is None or self.freq_mhz is None:
+            return None
+            
+        # Convert EIRP from watts to dBm
+        eirp_dbm = 10 * np.log10(eirp * 1000)
+        
+        # Calculate distance in meters
+        distance_m = self.geometry.distance(point) * 111319  # approximate conversion from degrees to meters
+        
+        # Use the coverage module to calculate signal strength
+        from grapho_terrain.telecommunications.coverage import calculate_signal_strength
+        return calculate_signal_strength(eirp_dbm, self.freq_mhz, distance_m, loss_exponent)
+        
+    def calculate_signal_strength_with_terrain(self, point, dem_model, loss_exponent=3.5, consider_diffraction=True, consider_reflection=True):
+        """
+        Calculate the signal strength at a specific location considering terrain and obstacles.
+        
+        Parameters
+        ----------
+        point : shapely.geometry.Point
+            The location to calculate signal strength at
+        dem_model : TerrainModel
+            Digital Elevation Model object to consider terrain
+        loss_exponent : float, optional
+            Path loss exponent (typically 2.0 to 5.0)
+        consider_diffraction : bool, optional
+            Whether to consider diffraction effects around obstacles
+        consider_reflection : bool, optional
+            Whether to consider reflection from flat surfaces
+            
+        Returns
+        -------
+        float or None
+            Received signal strength in dBm considering terrain, or None if required attributes are missing
+        """
+        if self.geometry is None or point is None or dem_model is None:
+            return None
+            
+        # Calculate basic parameters
+        eirp = self.calculate_eirp()
+        if eirp is None or self.freq_mhz is None or self.azimute is None:
+            return None
+            
+        # Convert EIRP from watts to dBm
+        eirp_dbm = 10 * np.log10(eirp * 1000)
+        
+        # Calculate angle and distance
+        dx = point.x - self.geometry.x
+        dy = point.y - self.geometry.y
+        angle_deg = (np.degrees(np.arctan2(dy, dx)) + 90) % 360  # Convert to azimuth where 0=North
+        distance_deg = self.geometry.distance(point)
+        distance_km = distance_deg * 111.319  # approximate conversion from degrees to km
+        
+        # Get base station and point elevations
+        from grapho_terrain.telecommunications.coverage import amostra_segura_mde
+        erb_elev = amostra_segura_mde(dem_model, self.geometry.x, self.geometry.y, 0)
+        if self.altura_m is not None:
+            erb_elev += self.altura_m  # Add antenna height
+        point_elev = amostra_segura_mde(dem_model, point.x, point.y, 0)
+        
+        # Check line of sight using effective radius calculation
+        from grapho_terrain.telecommunications.coverage import calc_effective_radius
+        result = calc_effective_radius(
+            self.geometry.y, self.geometry.x, angle_deg, 
+            dem_model, distance_km * 1.1,  # Use slightly larger radius than needed
+            angulo_setor=30,  # Use a narrow sector for precision
+            num_angulos=3,    # Focus on the direct path
+            num_passos=50,
+            considerar_difracao=consider_diffraction,
+            considerar_reflexao=consider_reflection,
+            freq_mhz=self.freq_mhz
+        )
+        
+        # Get the effective radius for this angle
+        # Find the closest angle in the result
+        angles = np.array(list(result["effective_radii"].keys()))
+        idx = np.argmin(np.abs(angles - angle_deg))
+        closest_angle = angles[idx]
+        effective_radius_km = result["effective_radii"][closest_angle]
+        
+        # Check if the point is within the effective radius
+        if distance_km <= effective_radius_km:
+            # Calculate signal with terrain effects
+            # Apply antenna directivity factor based on angle difference
+            azimuth_diff = abs((angle_deg - self.azimute) % 360)
+            if azimuth_diff > 180:
+                azimuth_diff = 360 - azimuth_diff
+                
+            # Simple directivity model: -3dB at +/-30 degrees, reduced signal beyond that
+            directivity_factor = 0
+            if azimuth_diff <= 30:
+                directivity_factor = 0  # Full gain within main beam
+            elif azimuth_diff <= 90:
+                directivity_factor = -3 * (azimuth_diff - 30) / 60  # Linear reduction to -3dB
+            else:
+                directivity_factor = -10  # Minimal signal outside main coverage
+            
+            # Calculate basic signal strength
+            from grapho_terrain.telecommunications.coverage import calculate_signal_strength
+            signal_dbm = calculate_signal_strength(
+                eirp_dbm, 
+                self.freq_mhz, 
+                distance_km * 1000,  # Convert to meters
+                loss_exponent
+            )
+            
+            # Apply directivity
+            signal_dbm += directivity_factor
+            
+            return signal_dbm
+        else:
+            # No line of sight, signal blocked by terrain
+            return -120  # Very weak signal (effective no signal)
 
 
 class ERBLayer:
@@ -409,6 +544,59 @@ def carregar_dados_erbs(caminho_csv):
     return ERBLayer.from_geodataframe(gdf, name="ERBs from CSV")
 
 
+def carregar_dados_erbs_personalizado(caminho_csv, crs_origem="EPSG:4326", crs_destino="EPSG:4326", lon_col='longitude', lat_col='latitude'):
+    """
+    Load ERB data from a CSV file with custom coordinate reference system.
+    
+    Parameters
+    ----------
+    caminho_csv : str
+        Path to the CSV file
+    crs_origem : str, optional
+        Original coordinate reference system of the data (default: "EPSG:4326")
+    crs_destino : str, optional
+        Target coordinate reference system (default: "EPSG:4326")
+    lon_col : str, optional
+        Column name for longitude data (default: 'longitude')
+    lat_col : str, optional
+        Column name for latitude data (default: 'latitude')
+        
+    Returns
+    -------
+    ERBLayer
+        Layer containing ERB data with coordinates in the target CRS
+    """
+    # Check if file exists
+    if not os.path.exists(caminho_csv):
+        raise FileNotFoundError(f"File not found: {caminho_csv}")
+        
+    # Read CSV file
+    try:
+        df = pd.read_csv(caminho_csv)
+    except Exception as e:
+        raise ValueError(f"Error reading CSV file: {e}")
+        
+    # Check for required columns
+    for col in [lon_col, lat_col]:
+        if col not in df.columns:
+            raise ValueError(f"Required column '{col}' not found in CSV file")
+            
+    # Create a GeoDataFrame with the original CRS
+    geometry = [Point(lon, lat) for lon, lat in zip(df[lon_col], df[lat_col])]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs=crs_origem)
+    
+    # Transform to target CRS if different
+    if crs_origem != crs_destino:
+        try:
+            gdf = gdf.to_crs(crs_destino)
+            print(f"Successfully transformed coordinates from {crs_origem} to {crs_destino}")
+        except Exception as e:
+            raise ValueError(f"Error transforming coordinates: {e}")
+    
+    # Create an ERBLayer
+    return ERBLayer.from_geodataframe(gdf, name=f"ERBs from CSV ({crs_destino})")
+
+
 def calcular_densidade_erb(ponto, gdf_erb, raio=0.01):
     """
     Calculate the ERB density around a point.
@@ -453,3 +641,59 @@ def calcular_densidade_erb(ponto, gdf_erb, raio=0.01):
         densidade = 0
         
     return densidade 
+
+def create_erb_layer(data, id_col='id', lat_col='latitude', lon_col='longitude', crs="EPSG:4326", **kwargs):
+    """
+    Create an ERB layer from a pandas DataFrame or a list of ERB objects.
+    
+    Parameters
+    ----------
+    data : pandas.DataFrame or list of ERB
+        Data containing ERB information or list of ERB objects
+    id_col : str, optional
+        Column name for the ERB ID (for DataFrame input)
+    lat_col : str, optional
+        Column name for latitude (for DataFrame input)
+    lon_col : str, optional
+        Column name for longitude (for DataFrame input)
+    crs : str or dict, optional
+        Coordinate reference system
+    **kwargs : dict
+        Additional parameters for ERB creation (for DataFrame input)
+        
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        GeoDataFrame containing ERB data
+    """
+    # Handle cases where data is a list of ERB objects
+    if isinstance(data, list) and all(isinstance(item, ERB) for item in data):
+        # Extract data from ERB objects
+        erb_data = []
+        for erb in data:
+            row_data = {"id": erb.id, "geometry": erb.geometry}
+            row_data.update(erb.attributes)
+            erb_data.append(row_data)
+            
+        # Create GeoDataFrame
+        return gpd.GeoDataFrame(erb_data, crs=crs)
+        
+    # Handle DataFrames
+    elif isinstance(data, pd.DataFrame):
+        # Create points from lat/lon
+        if lat_col in data.columns and lon_col in data.columns:
+            geometry = [Point(lon, lat) for lon, lat in zip(data[lon_col], data[lat_col])]
+        else:
+            raise ValueError(f"Columns {lat_col} and/or {lon_col} not found in DataFrame")
+            
+        # Create GeoDataFrame
+        gdf = gpd.GeoDataFrame(data, geometry=geometry, crs=crs)
+        
+        # Create ERB layer
+        layer = ERBLayer.from_geodataframe(gdf)
+        
+        # Return as GeoDataFrame
+        return layer.to_geodataframe()
+        
+    else:
+        raise ValueError("Input must be a DataFrame or a list of ERB objects") 
